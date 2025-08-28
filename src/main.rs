@@ -5,11 +5,12 @@ use std::net::SocketAddr;
 use std::io;
 use may::coroutine;
 use may::sync::mpsc;
+use may::go;
 use may_minihttp::{HttpServer, HttpService, Request, Response};
 use log::{info, error};
 
 mod http3;
-use http3::{Http3Service, Http3Request, Http3Server, Http3Client};
+use http3::{Http3Service, Http3Request, EnterpriseHttp3Server, EnterpriseHttp3Client};
 
 // 定义HTTP服务状态结构体
 pub struct ServerStatus {
@@ -17,6 +18,23 @@ pub struct ServerStatus {
     request_count: usize,
     last_request: String,
     http3_request_count: usize,
+    should_shutdown: bool,
+    active_connections: usize,
+    total_connections: usize,
+}
+
+impl Default for ServerStatus {
+    fn default() -> Self {
+        Self {
+            is_running: false,
+            request_count: 0,
+            last_request: String::new(),
+            http3_request_count: 0,
+            should_shutdown: false,
+            active_connections: 0,
+            total_connections: 0,
+        }
+    }
 }
 
 // 实现HTTP服务
@@ -54,7 +72,11 @@ struct SimpleHttp3Service {
 }
 
 impl Http3Service for SimpleHttp3Service {
-    fn handle_request(&self, request: Http3Request) -> String {
+    fn handle_request(&self, request: Http3Request) -> http3::Http3Result<http3::Http3Response> {
+        use http3::{Http3Response, Header};
+        use bytes::Bytes;
+        use std::time::Instant;
+        
         // 处理请求
         let path = request.path.clone();
         let method = request.method.clone();
@@ -68,15 +90,27 @@ impl Http3Service for SimpleHttp3Service {
         let message = format!("收到HTTP/3请求: {} {} (总请求数: {})", method, path, status.http3_request_count);
         let _ = self.sender.send(message);
         
-        // 返回响应内容
-        format!("Hello from Slint + TQUIC! (HTTP/3)\nMethod: {}\nPath: {}\nHeaders: {:?}", method, path, request.headers)
+        // 构建响应内容
+        let response_body = format!("Hello from Slint + TQUIC! (HTTP/3)\nMethod: {}\nPath: {}\nHeaders: {:?}", method, path, request.headers);
+        
+        // 返回HTTP/3响应
+        Ok(Http3Response {
+            status: 200,
+            headers: vec![
+                Header::new(b":status", b"200"),
+                Header::new(b"content-type", b"text/plain"),
+                Header::new(b"server", b"slint-tquic-server/1.0"),
+            ],
+            body: Bytes::from(response_body),
+            content_type: "text/plain".to_string(),
+            cache_control: None,
+            timestamp: Instant::now(),
+        })
     }
 }
 
 fn main() -> Result<(), slint::PlatformError> {
-    // 初始化日志
     env_logger::init();
-    info!("启动Slint + TQUIC HTTP/3应用");
     
     // 初始化may运行时
     may::config().set_workers(2);
@@ -87,6 +121,9 @@ fn main() -> Result<(), slint::PlatformError> {
         request_count: 0,
         last_request: String::new(),
         http3_request_count: 0,
+        should_shutdown: false,
+        active_connections: 0,
+        total_connections: 0,
     }));
     
     // 创建通信通道
@@ -131,18 +168,19 @@ fn main() -> Result<(), slint::PlatformError> {
             
             // 启动HTTP/3客户端请求
             let sender_for_client = sender_for_http3.clone();
-            unsafe {
-                coroutine::spawn(move || {
-                    match send_http3_request(sender_for_client) {
-                        Ok(_) => {
-                            info!("HTTP/3请求发送成功");
-                        }
-                        Err(e) => {
-                            error!("HTTP/3请求发送失败: {}", e);
-                        }
+            // 使用may的go!宏来启动协程
+            let _handle = go!(move || {
+                // 在may协程中使用tokio运行时执行async函数
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                match rt.block_on(send_http3_request(sender_for_client)) {
+                    Ok(_) => {
+                        info!("HTTP/3请求发送成功");
                     }
-                });
-            }
+                    Err(e) => {
+                        error!("HTTP/3请求发送失败: {}", e);
+                    }
+                }
+            });
         }
     });
     
@@ -172,34 +210,40 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     
-    // 启动HTTP/3服务器 - 在主线程中创建以避免Send trait问题
-    let http3_service = SimpleHttp3Service {
-        status: server_status.clone(),
-        sender: sender.clone(),
+    // 启动企业级HTTP/3服务器 - 在主线程中创建以避免Send trait问题
+    let http3_addr = "127.0.0.1:8443".parse().unwrap();
+    let http3_service_arc = Arc::new(http3::DefaultEnterpriseHttp3Service::new());
+    let http3_server_status = Arc::new(Mutex::new(ServerStatus::default()));
+    let http3_server = http3::EnterpriseHttp3Server::new(
+        http3_service_arc,
+        http3_server_status.clone(),
+    ).map_err(|e| slint::PlatformError::Other(format!("Failed to create HTTP/3 server: {:?}", e).into()))?;
+    
+    // 在主线程中启动企业级HTTP/3服务器
+    let sender_for_http3 = sender.clone();
+    let http3_server_clone = http3_server.clone();
+    let _http3_handle = unsafe {
+        may::coroutine::spawn(move || {
+            may::coroutine::scope(|scope| {
+                unsafe {
+                    scope.spawn(|| {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            let mut server = http3_server_clone;
+                            if let Err(e) = server.start(http3_addr, sender_for_http3.clone()).await {
+                                error!("Enterprise HTTP/3 server start failed: {:?}", e);
+                            }
+                            if let Err(e) = server.run_event_loop().await {
+                                error!("Enterprise HTTP/3 server event loop failed: {:?}", e);
+                            }
+                        });
+                    });
+                }
+            });
+        })
     };
     
-    let http3_addr = "127.0.0.1:8443".parse().unwrap();
-    let mut http3_server = Http3Server::new(
-        http3_addr,
-        http3_service,
-        server_status.clone(),
-        sender.clone(),
-    );
-    
-    // 在主线程中启动HTTP/3服务器
-    let http3_server = Arc::new(Mutex::new(http3_server));
-    let http3_server_clone = http3_server.clone();
-    
-    match http3_server_clone.lock().unwrap().start() {
-        Ok(_) => {
-            info!("HTTP/3服务器在主线程中启动成功");
-            let _ = sender.send("HTTP/3服务器已启动在 https://127.0.0.1:8443".to_string());
-        }
-        Err(e) => {
-            error!("HTTP/3服务器启动失败: {}", e);
-            let _ = sender.send(format!("HTTP/3服务器启动失败: {}", e));
-        }
-    }
+    info!("Enterprise HTTP/3服务器协程启动成功");
     
     // 设置初始服务器状态
     main_window.set_server_status("HTTP服务器准备启动...".into());
@@ -282,14 +326,12 @@ fn main() -> Result<(), slint::PlatformError> {
     
     // HTTP/3服务器事件处理将在UI事件循环中进行
     
-    // 使用定时器在UI事件循环中处理HTTP/3服务器事件
+    // 使用定时器在UI事件循环中处理企业级HTTP/3服务器事件
     let http3_server_for_timer = http3_server.clone();
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(100), move || {
-        if let Ok(mut server) = http3_server_for_timer.try_lock() {
-            if let Err(e) = server.process_events() {
-                error!("HTTP/3服务器事件处理失败: {}", e);
-            }
+        if let Err(e) = http3_server_for_timer.process_events() {
+            error!("Enterprise HTTP/3服务器事件处理失败: {}", e);
         }
     });
     
@@ -301,33 +343,24 @@ fn main() -> Result<(), slint::PlatformError> {
 }
 
 // HTTP/3客户端请求函数
-fn send_http3_request(sender: mpsc::Sender<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn send_http3_request(sender: mpsc::Sender<String>) -> Result<(), Box<dyn std::error::Error>> {
     info!("开始发送HTTP/3请求");
     
-    // 创建HTTP/3客户端
-    let client_addr: SocketAddr = "127.0.0.1:0".parse()?;
-    let mut client = Http3Client::new(client_addr, sender.clone())?;
-    
-    // 连接到服务器
+    // 设置服务器地址
     let server_addr: SocketAddr = "127.0.0.1:8443".parse()?;
-    client.connect(server_addr, "localhost")?;
     
-    // 准备请求头
-    let mut headers = std::collections::HashMap::new();
-    headers.insert("Host".to_string(), "localhost:8443".to_string());
-    headers.insert("User-Agent".to_string(), "Slint-TQUIC-Client/1.0".to_string());
-    headers.insert("Accept".to_string(), "*/*".to_string());
-    
-    // 发送GET请求
-    client.send_request("GET", "/test", headers)?;
-    
-    // 处理事件循环（简化版本）
-    for _ in 0..100 {
-        client.process_events()?;
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    // 使用优化的HTTP/3请求发送函数
+    match http3::send_enterprise_http3_request(server_addr, "/", "GET", None, None).await {
+        Ok(_) => {
+            let _ = sender.send("HTTP/3请求处理完成".to_string());
+            info!("HTTP/3请求发送成功");
+        }
+        Err(e) => {
+            let error_msg = format!("HTTP/3请求失败: {}", e);
+            let _ = sender.send(error_msg);
+            error!("HTTP/3请求失败: {}", e);
+        }
     }
-    
-    let _ = sender.send("HTTP/3请求处理完成".to_string());
     
     Ok(())
 }
