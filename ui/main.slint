@@ -1,0 +1,161 @@
+import { Button, VerticalBox, LineEdit, HorizontalBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "Slint + May HTTP/3应用";
+    preferred-width: 500px;
+    preferred-height: 500px;
+    
+    in-out property<string> message: "欢迎使用Slint + May!";
+    in-out property<string> input-text: "";
+    in-out property<string> server-status: "HTTP服务器准备中...";
+    in-out property<int> request-count: 0;
+    in-out property<int> http3-request-count: 0;
+    in-out property<string> http3-status: "HTTP/3服务器准备中...";
+    in-out property<string> http3-error: "";
+    in-out property<bool> http3-connected: false;
+    
+    callback button-clicked();
+    callback request-http1();
+    callback request-http3();
+    
+    VerticalBox {
+        alignment: start;
+        padding: 20px;
+        spacing: 15px;
+        
+        // 服务器状态区域
+        Rectangle {
+            height: 180px;
+            border-radius: 4px;
+            background: #f0f0f0;
+            padding: 10px;
+            
+            VerticalBox {
+                alignment: start;
+                spacing: 5px;
+                
+                Text {
+                    text: "服务器状态";
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                
+                Text {
+                    text: root.server-status;
+                    color: #007bff;
+                }
+                
+                HorizontalBox {
+                    spacing: 10px;
+                    
+                    Text {
+                        text: "HTTP/3状态:";
+                        font-weight: 600;
+                    }
+                    
+                    Text {
+                        text: root.http3-status;
+                        color: root.http3-connected ? #28a745 : #ffc107;
+                    }
+                    
+                    Rectangle {
+                        width: 12px;
+                        height: 12px;
+                        border-radius: 6px;
+                        background: root.http3-connected ? #28a745 : #dc3545;
+                    }
+                }
+                
+                if root.http3-error != "" : Text {
+                    text: "错误: " + root.http3-error;
+                    color: #dc3545;
+                    font-size: 12px;
+                }
+                
+                Text {
+                    text: "HTTP/1.1请求数量: " + root.request-count;
+                }
+                
+                Text {
+                    text: "HTTP/3请求数量: " + root.http3-request-count;
+                    color: #28a745;
+                }
+            }
+        }
+        
+        // 消息显示区域
+        Rectangle {
+            height: 100px;
+            border-radius: 4px;
+            background: #f8f9fa;
+            padding: 10px;
+            
+            VerticalBox {
+                alignment: start;
+                
+                Text {
+                    text: "消息:";
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                
+                Text {
+                    text: root.message;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        
+        // 输入区域
+        VerticalBox {
+            spacing: 10px;
+            
+            Text {
+                text: "输入测试:";
+                font-size: 16px;
+            }
+            
+            LineEdit {
+                placeholder-text: "请输入文本...";
+                text <=> root.input-text;
+                width: 100%;
+            }
+            
+            HorizontalBox {
+                alignment: center;
+                
+                Button {
+                    text: "提交";
+                    primary: true;
+                    width: 120px;
+                    height: 36px;
+                    clicked => {
+                        root.button-clicked();
+                    }
+                }
+                
+                Rectangle { width: 10px; }
+                
+                Button {
+                    text: "访问HTTP/1.1";
+                    width: 120px;
+                    height: 36px;
+                    clicked => {
+                        root.request-http1();
+                    }
+                }
+                
+                Rectangle { width: 10px; }
+                
+                Button {
+                    text: "访问HTTP/3";
+                    width: 120px;
+                    height: 36px;
+                    clicked => {
+                        root.request-http3();
+                    }
+                }
+            }
+        }
+    }
+}
