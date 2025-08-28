@@ -16,8 +16,8 @@ use tquic::h3::{
     Http3Config, Http3Event, Http3Error,
     Http3Handler, connection::Http3Connection
 };
-use tquic::h3::h3::{Header, Result as Http3Result};
-use tquic::tls::TlsConfig;
+use tquic::h3::{Header, Result as Http3Result};
+// TlsConfig在tquic v1.6.0中不再公开暴露，使用Config代替
 
 // 服务器状态结构体
 pub use crate::ServerStatus;
@@ -122,7 +122,7 @@ impl EnterpriseHttp3TransportHandler {
         server_status: Arc<Mutex<ServerStatus>>,
         message_sender: Sender<String>,
     ) -> TquicResult<Self> {
-        let config = Arc::new(Http3Config::new().map_err(|_| TquicError::InvalidConfig)?);
+        let config = Arc::new(Http3Config::new().map_err(|e| TquicError::InvalidConfig(e.to_string()))?);
         
         Ok(Self {
             service,
@@ -556,7 +556,7 @@ pub struct EnterpriseHttp3Server {
     server_status: Arc<Mutex<ServerStatus>>,
     endpoint: Option<Arc<Mutex<Endpoint>>>,
     config: Arc<Config>,
-    tls_config: Arc<TlsConfig>,
+    // tls_config已集成到config中
 }
 
 // 手动实现Send和Sync trait以支持跨线程使用
@@ -578,29 +578,17 @@ impl EnterpriseHttp3Server {
         config.set_initial_max_streams_bidi(100);
         config.set_initial_max_streams_uni(100);
         
-        // 创建企业级TLS配置
-        let tls_config = TlsConfig::new_server_config(
-            "temp_cert.pem",
-            "temp_key.pem",
-            vec![b"h3".to_vec()],
-            true, // enable_early_data
-        )?;
-        
-        let tls_config_clone = TlsConfig::new_server_config(
-            "temp_cert.pem",
-            "temp_key.pem",
-            vec![b"h3".to_vec()],
-            true, // enable_early_data
-        )?;
-        
-        config.set_tls_config(tls_config);
+        // 配置TLS和HTTP/3支持
+         config.set_application_protos(&[b"h3"])?;
+         config.load_cert_chain_from_pem_file("temp_cert.pem")?;
+         config.load_priv_key_from_pem_file("temp_key.pem")?;
         
         Ok(Self {
             service,
             server_status,
             endpoint: None,
             config: Arc::new(config),
-            tls_config: Arc::new(tls_config_clone),
+            // tls_config已集成到config中
         })
     }
     
@@ -628,7 +616,7 @@ impl EnterpriseHttp3Server {
         )?;
         
         // 创建数据包发送处理器
-        let packet_sender = Arc::new(EnterprisePacketSender::new());
+        let packet_sender = std::rc::Rc::new(EnterprisePacketSender::new());
         
         // 创建端点
         let endpoint = Endpoint::new(
@@ -638,9 +626,20 @@ impl EnterpriseHttp3Server {
             packet_sender,
         );
         
-        // 绑定地址
-        endpoint.listen(addr)?;
+        // 手动绑定UDP socket
+        let socket = UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        
+        // 设置socket到packet sender
+        if let Some(packet_sender) = endpoint.packet_sender() {
+            if let Ok(sender) = packet_sender.downcast::<EnterprisePacketSender>() {
+                *sender.socket.lock().unwrap() = Some(socket);
+            }
+        }
+        
         self.endpoint = Some(Arc::new(Mutex::new(endpoint)));
+        
+        info!("企业级HTTP/3服务器已绑定到地址: {}", addr);
         
         // 发送启动消息
         let _ = sender.send(format!("企业级HTTP/3服务器已启动在 {}", addr));
@@ -662,7 +661,7 @@ impl EnterpriseHttp3Server {
                     
                     // 检查是否需要关闭
                     if let Ok(status) = self.server_status.lock() {
-                        if status.shutdown_requested {
+                        if status.should_shutdown {
                             info!("Shutdown requested, closing enterprise HTTP/3 server");
                             endpoint.close(false);
                             break;
@@ -751,7 +750,7 @@ pub struct EnterpriseHttp3Client {
     endpoint: Option<Endpoint>,
     connection: Option<Connection>,
     config: Arc<Config>,
-    tls_config: Arc<TlsConfig>,
+    // tls_config已集成到config中
 }
 
 impl EnterpriseHttp3Client {
@@ -759,24 +758,15 @@ impl EnterpriseHttp3Client {
         // 创建客户端配置
         let mut config = Config::new()?;
         
-        // 创建客户端TLS配置
-        let tls_config = TlsConfig::new_client_config(
-            vec![b"h3".to_vec()],
-            true, // enable_early_data
-        )?;
-        
-        let tls_config_clone = TlsConfig::new_client_config(
-            vec![b"h3".to_vec()],
-            true, // enable_early_data
-        )?;
-        
-        config.set_tls_config(tls_config);
+        // 配置客户端TLS和HTTP/3支持
+         config.set_application_protos(&[b"h3"])?;
+         config.set_verify_peer(false); // 用于测试，生产环境应启用证书验证
         
         Ok(Self {
             endpoint: None,
             connection: None,
             config: Arc::new(config),
-            tls_config: Arc::new(tls_config_clone),
+            // tls_config已集成到config中
         })
     }
     
@@ -785,7 +775,7 @@ impl EnterpriseHttp3Client {
         
         // 创建客户端传输处理器
         let handler = Box::new(EnterpriseClientHandler::new());
-        let sender = Arc::new(EnterprisePacketSender::new());
+        let sender = std::rc::Rc::new(EnterprisePacketSender::new());
         
         // 创建客户端端点
         let mut endpoint = Endpoint::new(
