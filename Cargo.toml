@@ -15,5 +15,9 @@ ring = "0.17.14"
 log = "0.4.27"
 env_logger = "0.11.8"
 
+[[bin]]
+name = "cert_gen"
+path = "cert_gen.rs"
+
 [build-dependencies]
 slint-build = "1.12.1"
